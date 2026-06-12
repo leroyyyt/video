@@ -21,7 +21,10 @@ local: the server binds strictly to `127.0.0.1`.
   with automatic fallback to the next best available.
 - **Queue** as many links as you like; they download one at a time to stay
   system-friendly.
-- Live progress per video; per-item downloads and bulk **ZIP** export.
+- **Download all** at once across the whole queue, and a **ZIP / Individual
+  files** toggle so you decide whether bulk downloads come as one ZIP or as
+  separate files.
+- Live progress per video; per-item downloads and bulk export.
 - Binds to `127.0.0.1` only; one active download at a time.
 
 ## Output formats
@@ -85,9 +88,12 @@ python main.py
 2. Choose an **Output Format** (MP4 / iPhone / MP3) and a **Quality**, then
    press **Add**. The format and quality apply to that whole job — single
    video, every video in a playlist, and every link in the batch.
-3. Watch progress; press **Download** on each finished item, or
-   **Download all (.zip)** for playlists / multi-item jobs.
-4. **×** removes a job; **Clear finished** tidies completed ones.
+3. Watch progress; press **Download** on each finished item, **Download all**
+   on a job to grab everything in it, or the **Download all** button at the top
+   of the queue to grab every finished file across all jobs.
+4. Use the **ZIP / Individual files** toggle to choose how bulk downloads
+   arrive — one ZIP (with a folder per job), or each file downloaded separately.
+5. **×** removes a job; **Clear finished** tidies completed ones.
 
 Per-item downloads go to your browser's normal download location — point it at
 a `YoutubeVideos` folder if you'd like everything in one place. Files also live

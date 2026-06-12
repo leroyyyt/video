@@ -835,6 +835,55 @@ async def download_job(job_id: str):
     )
 
 
+def _build_zip_all(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> str:
+    """ZIP every completed item across all jobs, grouped into one folder per
+    job so files from different videos/playlists stay tidy and never collide."""
+    fd, tmp = tempfile.mkstemp(prefix="all-", suffix=".zip", dir=DOWNLOAD_DIR)
+    os.close(fd)
+    used: set[str] = set()
+    folder_for: Dict[str, str] = {}
+    used_folders: set[str] = set()
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as zf:
+        for job, it in pairs:
+            jid = job["id"]
+            if jid not in folder_for:
+                base = _SAFE_NAME.sub("_", (job["title"] or "videos")).strip() or "videos"
+                folder = base[:80]
+                n, root = 1, folder
+                while folder in used_folders:
+                    folder = f"{root} ({n})"
+                    n += 1
+                used_folders.add(folder)
+                folder_for[jid] = folder
+            src = Path(it["filepath"])
+            name = it["filename"] or src.name
+            arc = f"{folder_for[jid]}/{it['index'] + 1:03d} - {name}"
+            n, root = 1, arc
+            while arc in used:
+                arc = f"{root} ({n})"
+                n += 1
+            used.add(arc)
+            zf.write(src, arcname=arc)
+    return tmp
+
+
+@app.get("/download-all")
+async def download_all():
+    """Download every completed file across the whole queue as a single ZIP."""
+    pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for job in sorted(all_jobs(), key=lambda j: j["created_at"]):
+        for it in job["items"]:
+            if it["status"] == "completed" and it["filepath"] and Path(it["filepath"]).exists():
+                pairs.append((job, it))
+    if not pairs:
+        raise HTTPException(status_code=409, detail="No files are ready yet")
+    zip_path = _build_zip_all(pairs)
+    return FileResponse(
+        zip_path, media_type="application/zip", filename="YoutubeVideos.zip",
+        background=BackgroundTask(_safe_unlink, zip_path),
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
     # Single process only (in-memory state + one worker). Do NOT use --workers.

@@ -79,11 +79,25 @@
       margin: 26px 2px 10px;
     }
     .bar-head h2 { margin: 0; font-size: 13px; color: var(--muted); font-weight: 600; }
+    .bar-actions { display: flex; align-items: center; gap: 12px; }
     .link-btn {
       background: none; border: none; color: var(--faint); cursor: pointer;
       font-size: 12px; padding: 4px;
     }
-    .link-btn:hover { color: var(--err); }
+    .link-btn:hover { color: var(--accent); }
+    #clear:hover { color: var(--err); }
+    .link-btn:disabled { opacity: .4; cursor: not-allowed; }
+    .link-btn:disabled:hover { color: var(--faint); }
+
+    .seg { display: inline-flex; border: 1px solid var(--border);
+      border-radius: 8px; overflow: hidden; background: #11141d; }
+    .seg-btn {
+      background: none; border: none; color: var(--muted); cursor: pointer;
+      font-size: 11.5px; font-weight: 600; padding: 5px 11px;
+    }
+    .seg-btn:not(:first-child) { border-left: 1px solid var(--border); }
+    .seg-btn.active { color: #fff;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
 
     .empty { color: var(--faint); font-size: 13px; padding: 22px 2px; text-align: center; }
 
@@ -208,7 +222,14 @@
 
     <div class="bar-head">
       <h2 id="queue-label">QUEUE</h2>
-      <button id="clear" class="link-btn">Clear finished</button>
+      <div class="bar-actions">
+        <div class="seg" id="dlmode" title="How bulk downloads are delivered">
+          <button class="seg-btn active" data-mode="zip">ZIP</button>
+          <button class="seg-btn" data-mode="individual">Individual files</button>
+        </div>
+        <button id="dlall" class="link-btn" disabled>Download all</button>
+        <button id="clear" class="link-btn">Clear finished</button>
+      </div>
     </div>
 
     <div id="jobs"></div>
@@ -226,6 +247,10 @@
     const urlInput = $("url"), goBtn = $("go"), errLine = $("err");
     const jobsEl = $("jobs"), emptyEl = $("empty"), clearBtn = $("clear"), queueLabel = $("queue-label");
     const formatSel = $("format"), qualitySel = $("quality"), ffwarn = $("ffwarn");
+    const dlModeEl = $("dlmode"), dlAllBtn = $("dlall");
+
+    let downloadMode = "zip";   // "zip" | "individual"
+    let lastJobs = [];          // latest /jobs snapshot, used for bulk downloads
 
     // Quality options per output format.
     const VIDEO_QUALITY_OPTS = [
@@ -301,6 +326,57 @@
       a.remove();
     }
 
+    // Fire a series of single-file downloads with a small gap so the browser
+    // doesn't drop them (used for "Individual files" mode).
+    async function downloadMany(urls) {
+      for (const u of urls) {
+        triggerDownload(u);
+        await new Promise((r) => setTimeout(r, 700));
+      }
+    }
+
+    // Completed-item download URLs for one job, or for every job if job omitted.
+    function readyUrls(jobId) {
+      const urls = [];
+      for (const job of lastJobs) {
+        if (jobId && job.id !== jobId) continue;
+        for (const it of job.items) {
+          if (it.ready) urls.push(`/download/${job.id}/${it.index}`);
+        }
+      }
+      return urls;
+    }
+
+    // Bulk download for a single job (its "Download all" button).
+    function downloadJobAll(jobId) {
+      if (downloadMode === "individual") {
+        const urls = readyUrls(jobId);
+        if (urls.length) downloadMany(urls);
+      } else {
+        triggerDownload(`/download/${jobId}`);
+      }
+    }
+
+    // Bulk download for the whole queue.
+    function downloadEverything() {
+      if (downloadMode === "individual") {
+        const urls = readyUrls(null);
+        if (urls.length) downloadMany(urls);
+        else showErr("Nothing is ready to download yet.");
+      } else {
+        triggerDownload("/download-all");
+      }
+    }
+
+    // ZIP / Individual toggle.
+    dlModeEl.addEventListener("click", (e) => {
+      const btn = e.target.closest(".seg-btn");
+      if (!btn) return;
+      downloadMode = btn.dataset.mode;
+      [...dlModeEl.children].forEach((b) => b.classList.toggle("active", b === btn));
+    });
+    dlAllBtn.addEventListener("click", downloadEverything);
+
     function itemHTML(job, it) {
       let main;
       if (it.status === "completed") {
@@ -344,7 +420,7 @@
       let sub = "";
       if (isPlaylist) {
         const zip = job.completed >= 1
-          ? `<button class="zip-btn" data-action="dl-all" data-job="${job.id}">Download all (.zip)</button>`
+          ? `<button class="zip-btn" data-action="dl-all" data-job="${job.id}">Download all</button>`
           : "";
         sub = `<div class="job-sub"><span>${job.completed} / ${job.total} ready</span>${zip}</div>`;
       }
@@ -378,9 +454,14 @@
       } catch (_) { return; }
 
       const jobs = data.jobs || [];
+      lastJobs = jobs;
       emptyEl.style.display = jobs.length ? "none" : "block";
       queueLabel.textContent = jobs.length ? `QUEUE · ${jobs.length}` : "QUEUE";
       jobsEl.innerHTML = jobs.map(jobHTML).join("");
+
+      // Enable "Download all" only when at least one file is ready anywhere.
+      const anyReady = jobs.some((j) => j.items.some((it) => it.ready));
+      dlAllBtn.disabled = !anyReady;
     }
 
     async function addUrl() {
@@ -437,7 +518,7 @@
       const { action, job, index } = btn.dataset;
       if (action === "remove") removeJob(job);
       else if (action === "dl-item") triggerDownload(`/download/${job}/${index}`);
-      else if (action === "dl-all") triggerDownload(`/download/${job}`);
+      else if (action === "dl-all") downloadJobAll(job);
     });
 
     goBtn.addEventListener("click", addUrl);
