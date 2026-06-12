@@ -2,7 +2,22 @@ LOCAL VIDEO DOWNLOADER
 ======================
 
 A small website that runs on YOUR computer and downloads videos (or whole
-playlists) as MP4 files. Everything stays on your machine (127.0.0.1).
+playlists) as MP4 video, iPhone-compatible video, or MP3 audio. Everything
+stays on your machine (127.0.0.1).
+
+------------------------------------------------------------------
+OUTPUT FORMAT  (choose before pressing Add)
+------------------------------------------------------------------
+  MP4    = normal video file.
+  iPhone = video file (.mp4) encoded H.264/AAC so it plays natively on
+           iPhone — best for sending via Telegram and opening from the
+           Files app.
+  MP3    = audio / music only, saved as an .mp3 file.
+
+QUALITY: pick a video resolution (MP4/iPhone) or audio bitrate (MP3). If the
+chosen quality isn't available, the next best one is used automatically (e.g.
+choose 4K on a 720p video and you get 720p). The format + quality you pick
+apply to single videos, playlists, AND the whole queued batch.
 
 ------------------------------------------------------------------
 HOW TO START  (no commands to type)
@@ -19,11 +34,14 @@ close it to stop the app.
 ------------------------------------------------------------------
 ONE REQUIREMENT: FFmpeg
 ------------------------------------------------------------------
-FFmpeg merges the video + audio into the final MP4. Install it once:
+FFmpeg is strongly recommended (effectively required): it merges video +
+audio, transcodes iPhone output to H.264/AAC, and extracts MP3 audio. Without
+it, MP4 / iPhone / MP3 modes will not work and the web page shows a warning.
+Install it once:
   Windows :  winget install Gyan.FFmpeg
   macOS   :  brew install ffmpeg
   Linux   :  sudo apt install ffmpeg
-The launcher will warn you if it's missing.
+The launcher and the web UI both warn you if it's missing.
 
 ------------------------------------------------------------------
 USING IT

@@ -34,6 +34,29 @@
       color: var(--text); font-size: 14px; outline: none;
     }
     input[type="url"]:focus { border-color: var(--accent); }
+
+    .options { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+    .field { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 150px; }
+    .field label { font-size: 11px; color: var(--faint); font-weight: 600;
+      text-transform: uppercase; letter-spacing: .04em; padding-left: 2px; }
+    select {
+      padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
+      background: #11141d; color: var(--text); font-size: 14px; outline: none;
+      cursor: pointer; appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238b90a0' d='M6 8L2 4h8z'/%3E%3C/svg%3E");
+      background-repeat: no-repeat; background-position: right 12px center;
+    }
+    select:focus { border-color: var(--accent); }
+
+    .warn-banner {
+      margin-top: 12px; padding: 10px 12px; border-radius: 10px;
+      background: rgba(245,177,76,.1); border: 1px solid rgba(245,177,76,.4);
+      color: var(--warn); font-size: 12.5px; line-height: 1.5; display: none;
+    }
+    .warn-banner.show { display: block; }
+    .warn-banner code { background: rgba(255,255,255,.06); padding: 1px 5px;
+      border-radius: 5px; color: #ffd9a0; }
+
     button.primary {
       padding: 12px 18px; border: none; border-radius: 10px;
       font-size: 14px; font-weight: 600; color: #fff; cursor: pointer;
@@ -72,6 +95,12 @@
     .job-title { flex: 1; font-size: 14.5px; font-weight: 600; line-height: 1.35;
       overflow: hidden; text-overflow: ellipsis; }
     .job-title .meta { color: var(--faint); font-weight: 400; font-size: 12px; }
+    .fmt-tag {
+      display: inline-block; font-size: 10.5px; font-weight: 600;
+      padding: 2px 7px; border-radius: 6px; margin-top: 4px;
+      background: rgba(91,140,255,.12); color: var(--accent);
+      border: 1px solid rgba(91,140,255,.25); letter-spacing: .02em;
+    }
     .job-tools { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
     .icon-btn {
       background: none; border: 1px solid var(--border); color: var(--muted);
@@ -147,7 +176,7 @@
 <body>
   <div class="wrap">
     <h1>Local Video Downloader</h1>
-    <p class="sub">Queue multiple links — single videos or whole playlists. Each is saved as MP4.</p>
+    <p class="sub">Queue multiple links — single videos or whole playlists. Choose your output format and quality below.</p>
 
     <div class="composer">
       <div class="row">
@@ -156,7 +185,24 @@
         <button id="paste" class="ghost" title="Paste from clipboard">Paste</button>
         <button id="go" class="primary">Add</button>
       </div>
-      <p class="hint">Press Enter to queue. Add as many as you like — they download one at a time.</p>
+
+      <div class="options">
+        <div class="field">
+          <label for="format">Output Format</label>
+          <select id="format">
+            <option value="mp4">MP4 — normal video</option>
+            <option value="iphone">iPhone — H.264/AAC video</option>
+            <option value="mp3">MP3 — audio only</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="quality">Quality</label>
+          <select id="quality"></select>
+        </div>
+      </div>
+
+      <p class="hint">Press Enter to queue. The selected format &amp; quality apply to single videos, playlists and the whole batch. If your chosen quality isn't available, the next best is used automatically.</p>
+      <div id="ffwarn" class="warn-banner"></div>
       <p id="err" class="err-line"></p>
     </div>
 
@@ -179,10 +225,59 @@
     const $ = (id) => document.getElementById(id);
     const urlInput = $("url"), goBtn = $("go"), errLine = $("err");
     const jobsEl = $("jobs"), emptyEl = $("empty"), clearBtn = $("clear"), queueLabel = $("queue-label");
+    const formatSel = $("format"), qualitySel = $("quality"), ffwarn = $("ffwarn");
+
+    // Quality options per output format.
+    const VIDEO_QUALITY_OPTS = [
+      ["best", "Best available"], ["2160", "4K / 2160p"], ["1440", "1440p"],
+      ["1080", "1080p"], ["720", "720p"], ["480", "480p"], ["360", "360p"],
+    ];
+    const AUDIO_QUALITY_OPTS = [
+      ["best", "Best available"], ["320", "320 kbps"],
+      ["192", "192 kbps"], ["128", "128 kbps"],
+    ];
+
+    function fillQuality() {
+      const opts = formatSel.value === "mp3" ? AUDIO_QUALITY_OPTS : VIDEO_QUALITY_OPTS;
+      const prev = qualitySel.value;
+      qualitySel.innerHTML = opts
+        .map(([v, t]) => `<option value="${v}">${t}</option>`).join("");
+      // keep selection if still valid, else default to "best"
+      qualitySel.value = opts.some(([v]) => v === prev) ? prev : "best";
+    }
+    formatSel.addEventListener("change", fillQuality);
+    fillQuality();
+
+    const FMT_LABEL = { mp4: "MP4", iphone: "iPhone", mp3: "MP3" };
+    const QUAL_LABEL = {
+      best: "Best", "2160": "4K", "1440": "1440p", "1080": "1080p",
+      "720": "720p", "480": "480p", "360": "360p",
+      "320": "320kbps", "192": "192kbps", "128": "128kbps",
+    };
+
+    async function checkCapabilities() {
+      try {
+        const res = await fetch("/capabilities");
+        if (!res.ok) return;
+        const cap = await res.json();
+        if (cap.ffmpeg === false) {
+          ffwarn.innerHTML =
+            "⚠️ <strong>FFmpeg was not found.</strong> MP4 merging, iPhone " +
+            "re-encoding and MP3 extraction will not work until you install it. " +
+            "Install with <code>winget install Gyan.FFmpeg</code> (Windows), " +
+            "<code>brew install ffmpeg</code> (macOS) or " +
+            "<code>sudo apt install ffmpeg</code> (Linux), then restart the app.";
+          ffwarn.classList.add("show");
+        } else {
+          ffwarn.classList.remove("show");
+        }
+      } catch (_) {}
+    }
+    checkCapabilities();
 
     const STAGE_TEXT = {
       queued: "Queued", starting: "Starting…", downloading: "Downloading",
-      processing: "Processing…", merging: "Merging audio + video…",
+      processing: "Processing…", converting: "Merging / converting…",
       finalizing: "Finalising…", done: "Done",
     };
     const BADGE_TEXT = {
@@ -215,7 +310,7 @@
       } else if (it.stage === "downloading") {
         main = `<div class="mini"><span style="width:${it.progress}%"></span></div>
                 <div class="pct">${it.progress}%</div>`;
-      } else if (["merging", "finalizing", "processing", "starting"].includes(it.stage)) {
+      } else if (["converting", "finalizing", "processing", "starting"].includes(it.stage)) {
         main = `<div class="mini indeterminate"><span></span></div>
                 <div class="pct">${STAGE_TEXT[it.stage] || "Working…"}</div>`;
       } else {
@@ -257,9 +352,13 @@
       const items = job.items.map((it) => itemHTML(job, it)).join("");
       const removeDisabled = job.status === "processing" ? "disabled" : "";
 
+      const fmt = FMT_LABEL[job.output_format] || "MP4";
+      const qual = QUAL_LABEL[job.quality] || job.quality || "Best";
+      const fmtTag = `<div><span class="fmt-tag">${fmt} · ${qual}</span></div>`;
+
       return `<div class="job" data-job="${job.id}">
         <div class="job-head">
-          <div class="job-title">${esc(title)} <span class="meta">— ${metaBits}</span></div>
+          <div class="job-title">${esc(title)} <span class="meta">— ${metaBits}</span>${fmtTag}</div>
           <div class="job-tools">
             <span class="badge b-${job.status}">${BADGE_TEXT[job.status] || job.status}</span>
             <button class="icon-btn" data-action="remove" data-job="${job.id}" title="Remove" ${removeDisabled}>×</button>
@@ -293,7 +392,11 @@
         const res = await fetch("/jobs", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url }),
+          body: JSON.stringify({
+            url,
+            output_format: formatSel.value,
+            quality: qualitySel.value,
+          }),
         });
         if (res.status === 429) {
           const e = await res.json().catch(() => ({}));

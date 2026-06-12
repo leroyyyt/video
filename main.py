@@ -1,5 +1,5 @@
 """
-Local Video Downloader — FastAPI backend (queue + playlists).
+Local Video Downloader — FastAPI backend (queue + playlists + output formats).
 
 Highlights:
   * Bind strictly to 127.0.0.1 (never reachable over LAN / internet).
@@ -9,11 +9,18 @@ Highlights:
   * A "job" = one submitted URL. A job has one or more "items" (videos).
       - single video  -> 1 item
       - playlist       -> N items (capped by MAX_PLAYLIST_ITEMS)
-  * Every item is downloadable as its own MP4; multi-item jobs also offer a
-    "download all" ZIP.
-  * Files persist in downloads/<job_id>/ until you remove the job (trash
-    button / DELETE) or restart the app (startup sweep). Generated ZIPs are
-    temporary and deleted after they finish streaming.
+  * Each job carries an OUTPUT FORMAT and a QUALITY choice that apply to every
+    item in the job (single, playlist, or batch):
+      - mp4    -> normal MP4 video, pick a max video height (or "best").
+      - iphone -> iPhone-compatible MP4 (H.264 video + AAC audio).
+      - mp3    -> audio-only MP3 (pick a target bitrate or "best").
+    Quality always falls back to the next best available option.
+  * Every produced file is downloadable on its own; multi-item jobs also offer a
+    "download all" ZIP. Per-item downloads land in your browser's downloads
+    folder (point it at a "YoutubeVideos" folder if you like).
+  * FFmpeg is required for merging, iPhone re-encoding and MP3 extraction. If it
+    is missing the UI shows a clear warning and jobs that need it fail loudly
+    rather than crashing silently.
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ import os
 import queue
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import uuid
@@ -34,6 +42,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import yt_dlp
+from yt_dlp.postprocessor import PostProcessor
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, field_validator
@@ -53,14 +62,204 @@ PORT = 8000
 MAX_QUEUED_JOBS = 50        # soft cap on queued/processing jobs
 MAX_PLAYLIST_ITEMS = 50     # cap videos pulled from a single playlist
 
-FORMAT_SELECTOR = (
-    "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-)
+# ---- Output formats & quality ---------------------------------------------
+
+OUTPUT_FORMATS = ("mp4", "iphone", "mp3")
+
+# Video quality choices -> max height in pixels (None = best available).
+VIDEO_QUALITIES: Dict[str, Optional[int]] = {
+    "best": None,
+    "2160": 2160,
+    "1440": 1440,
+    "1080": 1080,
+    "720": 720,
+    "480": 480,
+    "360": 360,
+}
+
+# Audio (MP3) quality choices -> ffmpeg preferredquality value.
+# "best" maps to yt-dlp's "0" (best VBR). Others are target kbps.
+AUDIO_QUALITIES: Dict[str, str] = {
+    "best": "0",
+    "320": "320",
+    "192": "192",
+    "128": "128",
+}
+
+# Final container/extension produced for each output format.
+OUTPUT_EXT = {"mp4": "mp4", "iphone": "mp4", "mp3": "mp3"}
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s  %(levelname)-7s %(message)s"
 )
 logger = logging.getLogger("downloader")
+
+
+# ---------------------------------------------------------------------------
+# FFmpeg detection
+# ---------------------------------------------------------------------------
+
+def ffmpeg_available() -> bool:
+    """True if an ffmpeg binary is on PATH (re-checked each call — cheap)."""
+    return shutil.which("ffmpeg") is not None
+
+
+def ffprobe_path() -> Optional[str]:
+    return shutil.which("ffprobe")
+
+
+# ---------------------------------------------------------------------------
+# Format-selector builders (yt-dlp `format` strings) + postprocessors
+# ---------------------------------------------------------------------------
+
+def _mp4_format(height: Optional[int]) -> str:
+    """Normal MP4. Prefer mp4/m4a streams; fall back to any, then to a lower
+    quality automatically. yt-dlp picks the best available <= height, so
+    choosing 4K on a 720p video simply yields 720p."""
+    if height is None:
+        return (
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio/best"
+        )
+    h = height
+    return (
+        f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<={h}]+bestaudio/"
+        f"best[height<={h}]/"
+        f"bestvideo+bestaudio/best"
+    )
+
+
+def _iphone_format(height: Optional[int]) -> str:
+    """iPhone-compatible MP4. Strongly prefer H.264 (avc1) video + AAC (mp4a)
+    audio so no re-encode is needed for typical YouTube content (<=1080p).
+    The IPhoneCompatPP below re-encodes anything that slipped through."""
+    if height is None:
+        return (
+            "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio/best"
+        )
+    h = height
+    return (
+        f"bestvideo[height<={h}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+        f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<={h}]+bestaudio/"
+        f"best[height<={h}]/"
+        f"bestvideo+bestaudio/best"
+    )
+
+
+def _audio_format() -> str:
+    """Best audio stream; the MP3 extractor postprocessor converts it."""
+    return "bestaudio/best"
+
+
+class IPhoneCompatPP(PostProcessor):
+    """Ensure the final file is H.264 video + AAC audio in an MP4 container.
+
+    Most YouTube videos up to 1080p already ship avc1/mp4a, so the format
+    selector usually avoids any re-encode. For sources that are VP9/AV1/Opus
+    (e.g. 4K), this transcodes to H.264/AAC so the file plays natively on
+    iPhone after Telegram / Files.
+    """
+
+    def run(self, info):
+        path = info.get("filepath")
+        if not path or not os.path.exists(path):
+            return [], info
+        ffprobe = ffprobe_path()
+        vcodec = acodec = ""
+        if ffprobe:
+            try:
+                vcodec = subprocess.run(
+                    [ffprobe, "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=codec_name",
+                     "-of", "default=nw=1:nk=1", path],
+                    capture_output=True, text=True, timeout=30,
+                ).stdout.strip()
+                acodec = subprocess.run(
+                    [ffprobe, "-v", "error", "-select_streams", "a:0",
+                     "-show_entries", "stream=codec_name",
+                     "-of", "default=nw=1:nk=1", path],
+                    capture_output=True, text=True, timeout=30,
+                ).stdout.strip()
+            except Exception:
+                self.to_screen("ffprobe failed; assuming re-encode needed")
+
+        already_ok = vcodec in ("h264", "avc1") and acodec in ("aac", "mp4a")
+        target = os.path.splitext(path)[0] + ".mp4"
+        if already_ok and path.lower().endswith(".mp4"):
+            return [], info  # nothing to do — fast path
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise yt_dlp.utils.PostProcessingError(
+                "FFmpeg is required for iPhone output but was not found."
+            )
+
+        tmp_out = os.path.splitext(path)[0] + ".iphone.tmp.mp4"
+        # Copy streams that are already compatible; transcode the rest.
+        vargs = ["-c:v", "copy"] if vcodec in ("h264", "avc1") else \
+            ["-c:v", "libx264", "-preset", "fast", "-crf", "20",
+             "-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.1"]
+        aargs = ["-c:a", "copy"] if acodec in ("aac", "mp4a") else \
+            ["-c:a", "aac", "-b:a", "192k"]
+        cmd = [ffmpeg, "-y", "-i", path, *vargs, *aargs,
+               "-movflags", "+faststart", tmp_out]
+        self.to_screen("Making file iPhone-compatible (H.264/AAC)…")
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0 or not os.path.exists(tmp_out):
+            raise yt_dlp.utils.PostProcessingError(
+                "FFmpeg failed to produce an iPhone-compatible file:\n"
+                + proc.stderr[-800:]
+            )
+        # Replace original with the .mp4 result.
+        if path != target:
+            Path(path).unlink(missing_ok=True)
+        os.replace(tmp_out, target)
+        info["filepath"] = target
+        return [], info
+
+
+def build_ydl_opts(
+    output_format: str,
+    quality: str,
+    outtmpl: str,
+    progress_hook: Callable,
+    pp_hook: Callable,
+) -> Tuple[Dict[str, Any], List[PostProcessor]]:
+    """Construct yt-dlp options + extra postprocessors for a given format."""
+    opts: Dict[str, Any] = {
+        "outtmpl": outtmpl,
+        "progress_hooks": [progress_hook],
+        "postprocessor_hooks": [pp_hook],
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 3,
+        "fragment_retries": 3,
+        "concurrent_fragment_downloads": 4,
+    }
+    extra_pps: List[PostProcessor] = []
+
+    if output_format == "mp3":
+        opts["format"] = _audio_format()
+        opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": AUDIO_QUALITIES.get(quality, "192"),
+        }]
+    elif output_format == "iphone":
+        height = VIDEO_QUALITIES.get(quality, None)
+        opts["format"] = _iphone_format(height)
+        opts["merge_output_format"] = "mp4"
+        extra_pps.append(IPhoneCompatPP())
+    else:  # mp4 (default)
+        height = VIDEO_QUALITIES.get(quality, None)
+        opts["format"] = _mp4_format(height)
+        opts["merge_output_format"] = "mp4"
+
+    return opts, extra_pps
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +275,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def create_job(url: str) -> str:
+def create_job(url: str, output_format: str, quality: str) -> str:
     """Register a queued job and enqueue it for the worker."""
     with _lock:
         active = sum(
@@ -91,6 +290,8 @@ def create_job(url: str) -> str:
         _jobs[job_id] = {
             "id": job_id,
             "url": url,
+            "output_format": output_format,
+            "quality": quality,
             "type": None,            # video | playlist
             "status": "queued",      # queued | processing | completed | partial | failed
             "title": None,
@@ -100,7 +301,7 @@ def create_job(url: str) -> str:
             "updated_at": _now(),
         }
     _task_queue.put(job_id)
-    logger.info("Queued job %s (%s)", job_id, url)
+    logger.info("Queued job %s (%s) [%s/%s]", job_id, url, output_format, quality)
     return job_id
 
 
@@ -160,23 +361,24 @@ def _safe_filename(title: str, ext: str = "mp4") -> str:
     return f"{base[:120]}.{ext}"
 
 
-def _pick_output(paths: List[Path]) -> Optional[Path]:
+def _pick_output(paths: List[Path], prefer_ext: str = "mp4") -> Optional[Path]:
     real = [
         p for p in paths
-        if p.is_file() and p.suffix not in (".part", ".ytdl") and ".part-" not in p.name
+        if p.is_file() and p.suffix.lower() not in (".part", ".ytdl")
+        and ".part-" not in p.name and ".tmp." not in p.name
     ]
     if not real:
         return None
-    mp4s = [p for p in real if p.suffix.lower() == ".mp4"]
-    return max(mp4s or real, key=lambda p: p.stat().st_size)
+    preferred = [p for p in real if p.suffix.lower() == f".{prefer_ext.lower()}"]
+    return max(preferred or real, key=lambda p: p.stat().st_size)
 
 
-def _find_named_file(job_dir: Path, stem: str) -> Optional[Path]:
-    return _pick_output(list(job_dir.glob(f"{stem}.*")))
+def _find_named_file(job_dir: Path, stem: str, prefer_ext: str = "mp4") -> Optional[Path]:
+    return _pick_output(list(job_dir.glob(f"{stem}.*")), prefer_ext)
 
 
-def _find_indexed_file(job_dir: Path, n: int) -> Optional[Path]:
-    return _pick_output(list(job_dir.glob(f"{n:03d}.*")))
+def _find_indexed_file(job_dir: Path, n: int, prefer_ext: str = "mp4") -> Optional[Path]:
+    return _pick_output(list(job_dir.glob(f"{n:03d}.*")), prefer_ext)
 
 
 def _remove_job_files(job_id: str) -> None:
@@ -207,6 +409,10 @@ def _sweep_all() -> None:
                 p.unlink()
         except OSError:
             pass
+
+
+def _media_type(filename: str) -> str:
+    return "audio/mpeg" if filename.lower().endswith(".mp3") else "video/mp4"
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +446,7 @@ def _make_hooks(
         if i is None:
             return
         if d.get("status") == "started":
-            update_item(job_id, i, stage="merging")
+            update_item(job_id, i, stage="converting")
         elif d.get("status") == "finished":
             update_item(job_id, i, stage="finalizing")
 
@@ -299,6 +505,19 @@ def process_job(job_id: str) -> None:
     if job is None:          # removed while queued
         return
     url = job["url"]
+    output_format = job.get("output_format", "mp4")
+    quality = job.get("quality", "best")
+
+    # Hard requirement: every output format here relies on FFmpeg (merging,
+    # transcoding or audio extraction). Fail loudly instead of crashing silently.
+    if not ffmpeg_available():
+        update_job(
+            job_id, status="failed",
+            error="FFmpeg not found. Install FFmpeg and restart — it is required "
+                  "for MP4 merging, iPhone re-encoding and MP3 extraction.",
+        )
+        return
+
     update_job(job_id, status="processing")
     job_dir = DOWNLOAD_DIR / job_id
     job_dir.mkdir(exist_ok=True)
@@ -311,41 +530,39 @@ def process_job(job_id: str) -> None:
         return
 
     if meta["type"] == "playlist":
-        _download_playlist(job_id, job_dir, url, meta)
+        _download_playlist(job_id, job_dir, url, meta, output_format, quality)
     else:
-        _download_single(job_id, job_dir, url, meta)
+        _download_single(job_id, job_dir, url, meta, output_format, quality)
 
     _finalize(job_id)
 
 
-def _download_single(job_id: str, job_dir: Path, url: str, meta: Dict[str, Any]) -> None:
+def _download_single(
+    job_id: str, job_dir: Path, url: str, meta: Dict[str, Any],
+    output_format: str, quality: str,
+) -> None:
     update_job(job_id, type="video", title=meta["title"])
     set_items(job_id, [_new_item(0, meta["title"])])
+    ext = OUTPUT_EXT.get(output_format, "mp4")
 
     progress_hook, pp_hook = _make_hooks(job_id, lambda d: 0)
-    opts = {
-        "format": FORMAT_SELECTOR,
-        "merge_output_format": "mp4",
-        "outtmpl": str(job_dir / "video.%(ext)s"),
-        "progress_hooks": [progress_hook],
-        "postprocessor_hooks": [pp_hook],
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "retries": 3,
-        "fragment_retries": 3,
-        "concurrent_fragment_downloads": 4,
-    }
+    opts, extra_pps = build_ydl_opts(
+        output_format, quality, str(job_dir / "video.%(ext)s"),
+        progress_hook, pp_hook,
+    )
+    opts["noplaylist"] = True
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
+            for pp in extra_pps:
+                ydl.add_post_processor(pp, when="post_process")
             info = ydl.extract_info(url, download=True)
         title = info.get("title") or meta["title"]
-        produced = _find_named_file(job_dir, "video")
+        produced = _find_named_file(job_dir, "video", ext)
         if produced is None:
             raise RuntimeError("Download finished but no output file was found.")
         update_item(
             job_id, 0, status="completed", stage="done", progress=100.0,
-            title=title, filepath=str(produced), filename=_safe_filename(title, "mp4"),
+            title=title, filepath=str(produced), filename=_safe_filename(title, ext),
         )
         logger.info("Job %s item 0 -> %s", job_id, produced.name)
     except Exception as exc:
@@ -353,34 +570,32 @@ def _download_single(job_id: str, job_dir: Path, url: str, meta: Dict[str, Any])
         update_item(job_id, 0, status="failed", stage="error", error=str(exc))
 
 
-def _download_playlist(job_id: str, job_dir: Path, url: str, meta: Dict[str, Any]) -> None:
+def _download_playlist(
+    job_id: str, job_dir: Path, url: str, meta: Dict[str, Any],
+    output_format: str, quality: str,
+) -> None:
     entries = meta["entries"]
     update_job(job_id, type="playlist", title=meta["title"])
     set_items(job_id, [
         _new_item(i, e.get("title") or f"Video {i + 1}") for i, e in enumerate(entries)
     ])
+    ext = OUTPUT_EXT.get(output_format, "mp4")
 
     def resolver(d: Dict[str, Any]) -> Optional[int]:
         idx = (d.get("info_dict") or {}).get("playlist_index")
         return (idx - 1) if isinstance(idx, int) else None
 
     progress_hook, pp_hook = _make_hooks(job_id, resolver)
-    opts = {
-        "format": FORMAT_SELECTOR,
-        "merge_output_format": "mp4",
-        "outtmpl": str(job_dir / "%(playlist_index)03d.%(ext)s"),
-        "progress_hooks": [progress_hook],
-        "postprocessor_hooks": [pp_hook],
-        "ignoreerrors": True,          # skip a bad video, keep going
-        "quiet": True,
-        "no_warnings": True,
-        "playlistend": MAX_PLAYLIST_ITEMS,
-        "retries": 3,
-        "fragment_retries": 3,
-        "concurrent_fragment_downloads": 4,
-    }
+    opts, extra_pps = build_ydl_opts(
+        output_format, quality, str(job_dir / "%(playlist_index)03d.%(ext)s"),
+        progress_hook, pp_hook,
+    )
+    opts["ignoreerrors"] = True          # skip a bad video, keep going
+    opts["playlistend"] = MAX_PLAYLIST_ITEMS
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
+            for pp in extra_pps:
+                ydl.add_post_processor(pp, when="post_process")
             ydl.download([url])
     except Exception:
         logger.exception("Playlist download error for %s", url)
@@ -389,11 +604,11 @@ def _download_playlist(job_id: str, job_dir: Path, url: str, meta: Dict[str, Any
     job = get_job(job_id)
     for it in job["items"]:
         i = it["index"]
-        produced = _find_indexed_file(job_dir, i + 1)
+        produced = _find_indexed_file(job_dir, i + 1, ext)
         if produced is not None:
             update_item(
                 job_id, i, status="completed", stage="done", progress=100.0,
-                filepath=str(produced), filename=_safe_filename(it["title"], "mp4"),
+                filepath=str(produced), filename=_safe_filename(it["title"], ext),
             )
         elif it["status"] != "completed":
             update_item(
@@ -428,6 +643,11 @@ def _finalize(job_id: str) -> None:
 async def lifespan(app: FastAPI):
     _sweep_all()
     threading.Thread(target=worker_loop, name="dl-worker", daemon=True).start()
+    if not ffmpeg_available():
+        logger.warning(
+            "FFmpeg NOT found on PATH — MP4 merging, iPhone output and MP3 "
+            "extraction will not work until you install it."
+        )
     logger.info("Ready on http://%s:%s", HOST, PORT)
     yield
 
@@ -437,6 +657,8 @@ app = FastAPI(title="Local Video Downloader", docs_url=None, redoc_url=None, lif
 
 class JobRequest(BaseModel):
     url: str
+    output_format: str = "mp4"
+    quality: str = "best"
 
     @field_validator("url")
     @classmethod
@@ -445,6 +667,19 @@ class JobRequest(BaseModel):
         if not re.match(r"^https?://", v, re.IGNORECASE):
             raise ValueError("URL must start with http:// or https://")
         return v
+
+    @field_validator("output_format")
+    @classmethod
+    def _validate_format(cls, v: str) -> str:
+        v = (v or "mp4").strip().lower()
+        if v not in OUTPUT_FORMATS:
+            raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}")
+        return v
+
+    @field_validator("quality")
+    @classmethod
+    def _validate_quality(cls, v: str) -> str:
+        return (v or "best").strip().lower()
 
 
 def _public_item(it: Dict[str, Any]) -> Dict[str, Any]:
@@ -465,6 +700,8 @@ def _public_job(job: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": job["id"],
         "url": job["url"],
+        "output_format": job.get("output_format", "mp4"),
+        "quality": job.get("quality", "best"),
         "type": job["type"],
         "status": job["status"],
         "title": job["title"],
@@ -481,9 +718,20 @@ async def index() -> HTMLResponse:
     return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
 
 
+@app.get("/capabilities")
+async def capabilities():
+    """Frontend uses this to warn when FFmpeg is missing."""
+    return {
+        "ffmpeg": ffmpeg_available(),
+        "formats": list(OUTPUT_FORMATS),
+        "video_qualities": list(VIDEO_QUALITIES.keys()),
+        "audio_qualities": list(AUDIO_QUALITIES.keys()),
+    }
+
+
 @app.post("/jobs", status_code=202)
 async def submit_job(payload: JobRequest, background_tasks: BackgroundTasks):
-    job_id = create_job(payload.url)
+    job_id = create_job(payload.url, payload.output_format, payload.quality)
     return {"job_id": job_id, "status": "queued"}
 
 
@@ -537,7 +785,8 @@ async def download_item(job_id: str, item_index: int):
     path = Path(it["filepath"])
     if not path.exists():
         raise HTTPException(status_code=410, detail="File no longer available")
-    return FileResponse(path, media_type="video/mp4", filename=it["filename"] or path.name)
+    name = it["filename"] or path.name
+    return FileResponse(path, media_type=_media_type(name), filename=name)
 
 
 def _build_zip(job: Dict[str, Any], items: List[Dict[str, Any]]) -> str:
@@ -574,7 +823,8 @@ async def download_job(job_id: str):
     if len(completed) == 1 and len(job["items"]) == 1:
         it = completed[0]
         path = Path(it["filepath"])
-        return FileResponse(path, media_type="video/mp4", filename=it["filename"] or path.name)
+        name = it["filename"] or path.name
+        return FileResponse(path, media_type=_media_type(name), filename=name)
 
     # Multiple -> bundle a ZIP (temp file, deleted after streaming).
     zip_path = _build_zip(job, completed)
