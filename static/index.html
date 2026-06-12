@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Local Video Downloader</title>
+  <style>
+    :root {
+      --bg: #0f1117; --card: #181b24; --card-2: #141822; --border: #262a37;
+      --text: #e7e9ee; --muted: #8b90a0; --faint: #5b6072;
+      --accent: #5b8cff; --accent-2: #7c5bff;
+      --ok: #3ecf8e; --warn: #f5b14c; --err: #ff6b6b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; padding: 32px 18px;
+      display: flex; justify-content: center;
+      font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: var(--text);
+      background: radial-gradient(1200px 600px at 50% -10%, #1b2030, var(--bg));
+    }
+    .wrap { width: 100%; max-width: 660px; }
+    h1 { margin: 0 0 2px; font-size: 21px; letter-spacing: -.01em; }
+    .sub { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
+
+    .composer {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 14px; padding: 16px;
+    }
+    .row { display: flex; gap: 10px; }
+    input[type="url"] {
+      flex: 1; padding: 12px 14px; border-radius: 10px;
+      border: 1px solid var(--border); background: #11141d;
+      color: var(--text); font-size: 14px; outline: none;
+    }
+    input[type="url"]:focus { border-color: var(--accent); }
+    button.primary {
+      padding: 12px 18px; border: none; border-radius: 10px;
+      font-size: 14px; font-weight: 600; color: #fff; cursor: pointer;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    }
+    button.primary:hover { opacity: .92; }
+    button.primary:disabled { opacity: .5; cursor: not-allowed; }
+    button.ghost {
+      padding: 12px 16px; border-radius: 10px; cursor: pointer;
+      font-size: 14px; font-weight: 600; color: var(--text);
+      background: #11141d; border: 1px solid var(--border);
+    }
+    button.ghost:hover { border-color: var(--accent); color: var(--accent); }
+    .hint { margin: 10px 2px 0; font-size: 12px; color: var(--faint); }
+    .err-line { margin: 10px 2px 0; font-size: 13px; color: var(--err); display: none; }
+    .err-line.show { display: block; }
+
+    .bar-head {
+      display: flex; align-items: center; justify-content: space-between;
+      margin: 26px 2px 10px;
+    }
+    .bar-head h2 { margin: 0; font-size: 13px; color: var(--muted); font-weight: 600; }
+    .link-btn {
+      background: none; border: none; color: var(--faint); cursor: pointer;
+      font-size: 12px; padding: 4px;
+    }
+    .link-btn:hover { color: var(--err); }
+
+    .empty { color: var(--faint); font-size: 13px; padding: 22px 2px; text-align: center; }
+
+    .job {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 14px; padding: 14px 16px; margin-bottom: 12px;
+    }
+    .job-head { display: flex; align-items: flex-start; gap: 10px; }
+    .job-title { flex: 1; font-size: 14.5px; font-weight: 600; line-height: 1.35;
+      overflow: hidden; text-overflow: ellipsis; }
+    .job-title .meta { color: var(--faint); font-weight: 400; font-size: 12px; }
+    .job-tools { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+    .icon-btn {
+      background: none; border: 1px solid var(--border); color: var(--muted);
+      width: 26px; height: 26px; border-radius: 7px; cursor: pointer;
+      font-size: 16px; line-height: 1; display: grid; place-items: center;
+    }
+    .icon-btn:hover { color: var(--err); border-color: var(--err); }
+    .icon-btn:disabled { opacity: .35; cursor: not-allowed; }
+
+    .badge {
+      font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px;
+      border: 1px solid transparent; white-space: nowrap;
+    }
+    .b-queued     { color: var(--muted); background: #1f2430; }
+    .b-processing { color: var(--accent); background: rgba(91,140,255,.12); }
+    .b-completed  { color: var(--ok); background: rgba(62,207,142,.12); }
+    .b-partial    { color: var(--warn); background: rgba(245,177,76,.12); }
+    .b-failed     { color: var(--err); background: rgba(255,107,107,.12); }
+
+    .job-sub {
+      margin: 10px 0 2px; font-size: 12.5px; color: var(--muted);
+      display: flex; align-items: center; gap: 10px;
+    }
+    .zip-btn {
+      background: none; border: 1px solid var(--border); color: var(--accent);
+      font-size: 12px; font-weight: 600; padding: 5px 10px; border-radius: 8px;
+      cursor: pointer;
+    }
+    .zip-btn:hover { border-color: var(--accent); }
+
+    .items { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+    .item {
+      display: flex; align-items: center; gap: 12px;
+      background: var(--card-2); border: 1px solid var(--border);
+      border-radius: 10px; padding: 9px 11px;
+    }
+    .item-main { flex: 1; min-width: 0; }
+    .item-title {
+      font-size: 13px; margin-bottom: 6px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .item-status { font-size: 12px; color: var(--muted); }
+    .item-status.err { color: var(--err); }
+    .mini {
+      height: 6px; border-radius: 999px; background: #0e1119;
+      overflow: hidden; border: 1px solid var(--border);
+    }
+    .mini > span {
+      display: block; height: 100%; width: 0%;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+      transition: width .35s ease;
+    }
+    .mini.indeterminate > span {
+      width: 35% !important; animation: slide 1.1s ease-in-out infinite;
+    }
+    @keyframes slide { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
+    .pct { font-size: 11px; color: var(--faint); margin-top: 4px; }
+
+    .item-side { flex-shrink: 0; }
+    .dl-btn {
+      border: none; border-radius: 8px; padding: 7px 13px; cursor: pointer;
+      font-size: 12.5px; font-weight: 600; color: #fff;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    }
+    .dl-btn:hover { opacity: .92; }
+    .tag { font-size: 12px; color: var(--faint); }
+    .tag.ok { color: var(--ok); }
+    .tag.err { color: var(--err); }
+
+    .foot { margin-top: 24px; font-size: 11px; color: var(--faint); line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Local Video Downloader</h1>
+    <p class="sub">Queue multiple links — single videos or whole playlists. Each is saved as MP4.</p>
+
+    <div class="composer">
+      <div class="row">
+        <input id="url" type="url" placeholder="https://…  (video or playlist URL)"
+               autocomplete="off" spellcheck="false" />
+        <button id="paste" class="ghost" title="Paste from clipboard">Paste</button>
+        <button id="go" class="primary">Add</button>
+      </div>
+      <p class="hint">Press Enter to queue. Add as many as you like — they download one at a time.</p>
+      <p id="err" class="err-line"></p>
+    </div>
+
+    <div class="bar-head">
+      <h2 id="queue-label">QUEUE</h2>
+      <button id="clear" class="link-btn">Clear finished</button>
+    </div>
+
+    <div id="jobs"></div>
+    <div id="empty" class="empty">Nothing queued yet.</div>
+
+    <p class="foot">
+      Runs locally on 127.0.0.1. Files stay in <code>downloads/</code> until you remove a job
+      or restart. Only download content you own or have the right to download — respect each
+      site's terms of service and copyright.
+    </p>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const urlInput = $("url"), goBtn = $("go"), errLine = $("err");
+    const jobsEl = $("jobs"), emptyEl = $("empty"), clearBtn = $("clear"), queueLabel = $("queue-label");
+
+    const STAGE_TEXT = {
+      queued: "Queued", starting: "Starting…", downloading: "Downloading",
+      processing: "Processing…", merging: "Merging audio + video…",
+      finalizing: "Finalising…", done: "Done",
+    };
+    const BADGE_TEXT = {
+      queued: "Queued", processing: "Downloading", completed: "Done",
+      partial: "Partial", failed: "Failed",
+    };
+
+    function esc(s) {
+      return (s ?? "").toString().replace(/[&<>"']/g, (c) =>
+        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    function showErr(msg) { errLine.textContent = msg; errLine.classList.add("show"); }
+    function clearErr() { errLine.classList.remove("show"); }
+
+    function triggerDownload(href) {
+      const a = document.createElement("a");
+      a.href = href;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+
+    function itemHTML(job, it) {
+      let main;
+      if (it.status === "completed") {
+        main = `<div class="item-status ok-text">Ready</div>`;
+      } else if (it.status === "failed") {
+        main = `<div class="item-status err">${esc(it.error || "Failed")}</div>`;
+      } else if (it.stage === "downloading") {
+        main = `<div class="mini"><span style="width:${it.progress}%"></span></div>
+                <div class="pct">${it.progress}%</div>`;
+      } else if (["merging", "finalizing", "processing", "starting"].includes(it.stage)) {
+        main = `<div class="mini indeterminate"><span></span></div>
+                <div class="pct">${STAGE_TEXT[it.stage] || "Working…"}</div>`;
+      } else {
+        main = `<div class="item-status">Queued</div>`;
+      }
+
+      let side;
+      if (it.status === "completed") {
+        side = `<button class="dl-btn" data-action="dl-item" data-job="${job.id}" data-index="${it.index}">Download</button>`;
+      } else if (it.status === "failed") {
+        side = `<span class="tag err">—</span>`;
+      } else {
+        side = `<span class="tag">…</span>`;
+      }
+
+      return `<div class="item">
+        <div class="item-main">
+          <div class="item-title">${esc(it.title)}</div>
+          ${main}
+        </div>
+        <div class="item-side">${side}</div>
+      </div>`;
+    }
+
+    function jobHTML(job) {
+      const isPlaylist = job.type === "playlist" || job.total > 1;
+      const metaBits = isPlaylist ? `playlist · ${job.total} video${job.total === 1 ? "" : "s"}` : "single video";
+      const title = job.title || job.url;
+
+      // Sub line: progress count + zip button (multi-item, ≥1 done).
+      let sub = "";
+      if (isPlaylist) {
+        const zip = job.completed >= 1
+          ? `<button class="zip-btn" data-action="dl-all" data-job="${job.id}">Download all (.zip)</button>`
+          : "";
+        sub = `<div class="job-sub"><span>${job.completed} / ${job.total} ready</span>${zip}</div>`;
+      }
+
+      const items = job.items.map((it) => itemHTML(job, it)).join("");
+      const removeDisabled = job.status === "processing" ? "disabled" : "";
+
+      return `<div class="job" data-job="${job.id}">
+        <div class="job-head">
+          <div class="job-title">${esc(title)} <span class="meta">— ${metaBits}</span></div>
+          <div class="job-tools">
+            <span class="badge b-${job.status}">${BADGE_TEXT[job.status] || job.status}</span>
+            <button class="icon-btn" data-action="remove" data-job="${job.id}" title="Remove" ${removeDisabled}>×</button>
+          </div>
+        </div>
+        ${sub}
+        <div class="items">${items}</div>
+      </div>`;
+    }
+
+    async function refresh() {
+      let data;
+      try {
+        const res = await fetch("/jobs");
+        if (!res.ok) return;
+        data = await res.json();
+      } catch (_) { return; }
+
+      const jobs = data.jobs || [];
+      emptyEl.style.display = jobs.length ? "none" : "block";
+      queueLabel.textContent = jobs.length ? `QUEUE · ${jobs.length}` : "QUEUE";
+      jobsEl.innerHTML = jobs.map(jobHTML).join("");
+    }
+
+    async function addUrl() {
+      const url = urlInput.value.trim();
+      if (!url) { showErr("Please enter a URL."); return; }
+      clearErr();
+      goBtn.disabled = true;
+      try {
+        const res = await fetch("/jobs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url }),
+        });
+        if (res.status === 429) {
+          const e = await res.json().catch(() => ({}));
+          showErr(e.detail || "Queue is full.");
+        } else if (!res.ok) {
+          const e = await res.json().catch(() => ({ detail: "Request failed" }));
+          const detail = Array.isArray(e.detail) ? e.detail[0]?.msg : e.detail;
+          showErr(detail || "Request failed");
+        } else {
+          urlInput.value = "";
+          await refresh();
+        }
+      } catch (e) {
+        showErr("Network error: " + e.message);
+      } finally {
+        goBtn.disabled = false;
+        urlInput.focus();
+      }
+    }
+
+    async function removeJob(id) {
+      try {
+        const res = await fetch("/jobs/" + id, { method: "DELETE" });
+        if (res.status === 409) showErr("That job is still downloading — wait for it to finish.");
+      } catch (_) {}
+      refresh();
+    }
+
+    async function clearFinished() {
+      try { await fetch("/jobs", { method: "DELETE" }); } catch (_) {}
+      refresh();
+    }
+
+    // Event delegation for all per-job/item buttons.
+    jobsEl.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-action]");
+      if (!btn) return;
+      const { action, job, index } = btn.dataset;
+      if (action === "remove") removeJob(job);
+      else if (action === "dl-item") triggerDownload(`/download/${job}/${index}`);
+      else if (action === "dl-all") triggerDownload(`/download/${job}`);
+    });
+
+    goBtn.addEventListener("click", addUrl);
+    clearBtn.addEventListener("click", clearFinished);
+    urlInput.addEventListener("keydown", (e) => { if (e.key === "Enter") addUrl(); });
+
+    $("paste").addEventListener("click", async () => {
+      try {
+        const t = await navigator.clipboard.readText();
+        if (t && t.trim()) { urlInput.value = t.trim(); clearErr(); urlInput.focus(); }
+        else showErr("Clipboard is empty.");
+      } catch (_) {
+        showErr("Couldn't read the clipboard — long-press the box and paste manually.");
+      }
+    });
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
